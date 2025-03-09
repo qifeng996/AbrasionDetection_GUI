@@ -1,14 +1,12 @@
 import {Component} from "react";
 // import {invoke} from "@tauri-apps/api/core";
-import {Button, Drawer, Form, NotificationPlugin, Select, SelectOption} from "tdesign-react";
+import {Button, Drawer, Form, NotificationPlugin, Select, Tabs} from "tdesign-react";
 import './App.css'
 import 'tdesign-react/es/style/index.css';
 import type {SelectProps} from "tdesign-react";
 import * as echarts from 'echarts';
 import {listen} from "@tauri-apps/api/event";
 import {invoke} from "@tauri-apps/api/core";
-import {appConfigDir} from "@tauri-apps/api/path"
-
 interface name {
     data: number[];
 }
@@ -17,9 +15,13 @@ interface data {
     time: number,
     num: number[],
 }
+interface port_info{
+    port: string,
+    info: string,
 
+}
 interface serial_list {
-    port_vec: string[]
+    port_vec: port_info[]
 }
 
 class App extends Component {
@@ -27,12 +29,13 @@ class App extends Component {
         dynamicOptions: [] as SelectProps[],
         drawerVisible: false,
         dataChart: null as echarts.ECharts | null,
-        port_list: [] as SelectOption[],
+        port_list: [] as port_info[],
         isConnected: false,
+        menuValue:0 as number
     };
     dataList: data[] = [];
     timerID: number = 0;
-
+    bandRateList:number[] = [110,300,600,1200,2400,4800,9600,14400,19200,38400,56000,57600,115200,128000,230400,256000];
     updateChart = () => {
         if (this.state.dataChart) {
             this.state.dataChart.setOption({
@@ -44,40 +47,10 @@ class App extends Component {
             });
         }
     };
-    updatePort = (portVec: SelectOption[]) => {
+    updatePort = (portVec: port_info[]) => {
         this.setState({port_list: portVec});
     }
-
-    componentDidMount() {
-        listen<name>("data_received", (event) => {
-            this.dataList.push({num: event.payload.data, time: Date.now()});
-            // this.updateChart();
-
-        }).then(r => {
-            return r
-        })
-        listen<serial_list>("serial_change", (event) => {
-            let port = [] as SelectOption[];
-            for (const port_info of event.payload.port_vec) {
-                port.push({
-                    value: port_info,
-                    label: port_info
-                })
-            }
-            this.updatePort(port);
-            console.log(port);
-
-        }).then(UnlistenFn => {
-            return UnlistenFn;
-        });
-        this.timerID = setInterval(() => {
-            this.updateChart();
-        }, 500);
-        const options: SelectProps[] = [];
-        for (let i = 0; i < 20; i++) {
-            options.push({label: "选项" + (i + 1), value: i})
-        }
-        this.setState({dynamicOptions: options});
+    initChart = () => {
         const myChart = echarts.init(document.getElementById('main'));
         myChart.setOption({
             title: {
@@ -98,7 +71,7 @@ class App extends Component {
             },
             legend: {
                 orient: 'vertical',
-                right: 10,
+                right: 30,
                 top: 20,
                 bottom: 20,
             },
@@ -118,8 +91,19 @@ class App extends Component {
             })),
         });
         this.setState({dataChart: myChart});
+    }
+    componentDidMount() {
+        listen<name>("data_received", (event) => {
+            this.dataList.push({num: event.payload.data, time: Date.now()})
+        }).then(r => {
+            return r
+        })
+        this.timerID = setInterval(() => {
+            this.updateChart();
+        }, 500);
+        this.initChart();
         window.addEventListener('resize', () => {
-            myChart.resize();
+            this.state.dataChart?.resize();
         })
     }
 
@@ -133,8 +117,48 @@ class App extends Component {
     render() {
         return (
             <div style={{width: "100%", height: "95vh"}}>
-                <div id="main"
-                     style={{width: "100%", height: "95%", backgroundColor: "#ffffff", borderRadius: "16px"}}></div>
+                <Tabs placement={'top'} size={'medium'} defaultValue={1} style={{height: "95vh"}} onChange={(value)=>{
+                    if (value==1) {
+                        requestAnimationFrame(() => {
+                            this.initChart();
+                        });
+                    }
+                }}>
+                    <Tabs.TabPanel value={1} label="实时监测" style={{height:'95vh'}}>
+                        <div id="main"
+                             style={{width: "100%", height: "85%", backgroundColor: "#ffffff", borderRadius: "16px"}}></div>
+                        <Button
+                            shape="rectangle"
+                            size="medium"
+                            type="button"
+                            variant="base"
+                            style={{marginLeft: "auto"}}
+                            onClick={async () => {
+                                this.setState({drawerVisible: true});
+                                (await invoke<serial_list>("get_port", {}).then(response => {
+                                    this.updatePort(response.port_vec);
+                                }).catch(err => {
+                                    NotificationPlugin.error({
+                                        title: '获取串口列表失败',
+                                        content: err,
+                                        placement: 'top-right',
+                                        duration: 3000,
+                                        offset: [0, 0],
+                                        closeBtn: true,
+                                    }).then(() => {
+                                        console.log("打开消息通知成功");
+                                    });
+                                }))
+                            }}
+                        >
+                            设置
+                        </Button>
+                    </Tabs.TabPanel>
+                    <Tabs.TabPanel value={2} label="数据处理">
+                        <p style={{ padding: 25 }}>选项卡2的内容，使用 TabPanel 渲染</p>
+                    </Tabs.TabPanel>
+                </Tabs>
+
                 <Drawer header="串口设置" visible={this.state.drawerVisible}
                         onClose={() => this.setState({drawerVisible: false})}
                         footer={(
@@ -150,6 +174,11 @@ class App extends Component {
                     <Form
                         id="serialForm"
                         labelWidth={60}
+                        initialData={{
+                            bandRate: 9600,
+                            dataBits: 8,
+                            stopBits: 1,
+                        }}
                         onSubmit={(m) => {
                             if (this.state.isConnected) {
                                 invoke("stop_serial_task", {})
@@ -219,26 +248,37 @@ class App extends Component {
 
                             console.log(m.fields);
                         }}>
-                        <Form.FormItem label="端口号" name={"portName"} rules={[{required: true}]}>
-                            <Select
-                                options={this.state.port_list}>
+                        <Form.FormItem label="端口号" name={"portName"}>
+                            <Select>
+                                {this.state.port_list.map(port => {
+                                    return (<Select.Option style={{ height: '60px' }} value={port.port} label={port.port}>
+                                        <div style={{ marginLeft: '16px' }}>
+                                            <div>{port.port}</div>
+                                            <div
+                                                style={{
+                                                    fontSize: '13px',
+                                                    color: 'var(--td-gray-color-9)',
+                                                }}
+                                            >
+                                                {port.info}
+                                            </div>
+                                        </div>
+                                    </Select.Option>)
+                                })}
                             </Select>
                         </Form.FormItem>
-                        <Form.FormItem label="波特率" name={"bandRate"} rules={[{required: true}]}>
+                        <Form.FormItem label="波特率" name={"bandRate"}>
                             <Select
-                                options={[
-                                    {
-                                        label: "9600",
-                                        value: 9600
-                                    },
-                                    {
-                                        label: "115200",
-                                        value: 115200
-                                    },
-                                ]}>
+                                options={this.bandRateList.map((value) => {
+                                    return ({
+                                        value: value,
+                                        label: value.toString()
+                                    })
+                                })}
+                            >
                             </Select>
                         </Form.FormItem>
-                        <Form.FormItem label="数据位" name={"dataBits"} rules={[{required: true}]}>
+                        <Form.FormItem label="数据位" name={"dataBits"}>
                             <Select
                                 options={[
                                     {
@@ -260,16 +300,12 @@ class App extends Component {
                                 ]}>
                             </Select>
                         </Form.FormItem>
-                        <Form.FormItem label="停止位" name={"stopBits"} rules={[{required: true}]}>
+                        <Form.FormItem label="停止位" name={"stopBits"}>
                             <Select
                                 options={[
                                     {
                                         label: "1",
                                         value: 1
-                                    },
-                                    {
-                                        label: "1.5",
-                                        value: 1.5
                                     },
                                     {
                                         label: "2",
@@ -280,21 +316,7 @@ class App extends Component {
                         </Form.FormItem>
                     </Form>
                 </Drawer>
-                <Button
-                    shape="rectangle"
-                    size="medium"
-                    type="button"
-                    variant="base"
-                    style={{marginLeft: "auto"}}
-                    onClick={async () => {
-                        this.setState({drawerVisible: true});
-                        let a = await appConfigDir();
-                        console.log(a)
-                        invoke("greet", {name: "helloworld"});
-                    }}
-                >
-                    设置
-                </Button>
+
             </div>
         );
     }
