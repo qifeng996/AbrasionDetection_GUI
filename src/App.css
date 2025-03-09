@@ -1,0 +1,16 @@
+:root {
+    color: #1f1f1f;
+    background-color: #d0d0d0;
+    width: 98%;
+    margin-left: 1%;
+    height: 98%;
+    margin-top: 1%;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        color: #f6f6f6;
+        background-color: #2f2f2f;
+        width: 95vw;
+    }
+}
