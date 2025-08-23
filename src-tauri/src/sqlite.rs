@@ -1,4 +1,4 @@
-use crate::StateWrapper;
+use crate::{AppWrapper};
 use chrono::Local;
 use rusqlite::{params, Connection};
 use tauri::path::BaseDirectory;
@@ -107,7 +107,7 @@ pub fn insert_data(parent_id: i64, angle: f32, data: &Vec<i32>) -> Result<(), St
 
 #[tauri::command]
 pub fn get_data_by_parent_id(
-    state: tauri::State<StateWrapper>,
+    state: tauri::State<AppWrapper>,
     parent_id: i32,
 ) -> Result<Vec<Data>, String> {
     let conn = connect_to_db().expect("Failed to connect to DB");
@@ -143,7 +143,7 @@ pub fn get_data_by_parent_id(
     Ok(data_list)
 }
 #[tauri::command]
-pub fn gen_xlsx(state: tauri::State<StateWrapper>, parent_id: i32) -> Result<String, String> {
+pub fn gen_xlsx(state: tauri::State<AppWrapper>, parent_id: i32) -> Result<String, String> {
     let mut book = umya_spreadsheet::new_file();
     let conn = connect_to_db().expect("Failed to connect to DB");
     let sheet = book.get_sheet_by_name_mut("Sheet1").unwrap();
@@ -216,7 +216,7 @@ pub fn gen_xlsx(state: tauri::State<StateWrapper>, parent_id: i32) -> Result<Str
             Err(_) => {}
         }
     }
-    let app_handle = &state.app.try_lock().unwrap().app_handler;
+    let app_handle = &state.app_handler;
     let mut path = app_handle
         .path()
         .resolve("", BaseDirectory::AppCache)

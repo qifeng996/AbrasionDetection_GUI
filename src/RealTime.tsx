@@ -1,6 +1,6 @@
 import {useState, useEffect, useRef} from "react";
 import {
-    Button,
+    Button, Card,
     Dialog,
     Drawer,
     Form,
@@ -9,7 +9,7 @@ import {
     NotificationPlugin,
     Select,
     Slider,
-    Space
+    Space, Typography
 } from "tdesign-react";
 import {invoke, InvokeArgs} from "@tauri-apps/api/core";
 import * as echarts from "echarts";
@@ -99,26 +99,52 @@ function RealTime() {
                 textAlign: "center",
                 left: "center",
             },
-            tooltip: {},
-            xAxis: {
+            tooltip: {
+                trigger: 'axis',  // 根据 x 轴显示 tooltip，而不是点
+            },
+            xAxis: [{
                 type: "value",
                 min: 0,
                 max: 360,
                 name: "角度(°)",
                 interval: 60,
-            },
-            yAxis: {
-                type: "value",
-            },
+                axisLine: {
+                    onZero: false  // 不再对齐 Y 轴零点
+                },
+            }],
+            yAxis: [
+                {
+                    type: 'value',
+                    name: 'ADC值',
+                },
+                {
+                    type: 'value',
+                    name: '电压 (V)',
+                    axisLabel: {
+                        formatter: function (value: number) {
+                            return (value * 3.3 / 4095).toFixed(2); // 假设ADC 12位
+                        }
+                    }
+                }
+            ],
             legend: {orient: "vertical", right: 30, top: 20, bottom: 20},
 
             series: Array.from({length: 9}).map((_, index) => ({
                 name: `${index + 1}号传感器`,
                 type: "line",
-                symbolSize: 5,
+                symbolSize: 0,
+                yAxisIndex: 0,
                 smooth: true,
                 data: [],
-            }))
+            })),
+            dataZoom: [
+                {
+                    id: 'dataZoomX',
+                    type: 'slider',
+                    xAxisIndex: [0],
+                    filterMode: 'filter'
+                }
+            ]
         });
         dataChart.current = myChart;
     };
@@ -265,6 +291,7 @@ function RealTime() {
                 >
                     设置
                 </Button>
+                <Card>当前角度：0.00°</Card>
             </Space>
 
 
@@ -437,7 +464,8 @@ function RealTime() {
                             series: Array.from({length: 9}).map((_, index) => ({
                                 name: `${index + 1}号传感器`,
                                 type: "line",
-                                symbolSize: 5,
+                                symbolSize: 0,
+                                yAxisIndex: 0,
                                 smooth: true,
                                 data: [],  // 清空数据
                             }))
@@ -526,7 +554,7 @@ function RealTime() {
                                 });
                                 if (selectPath) {
                                     console.log(selectPath)
-                                    form.setFieldsValue({hallPath: selectPath})
+                                    form.setFieldsValue({vPath: selectPath})
                                 }
                             }}>
                                 <FileIcon></FileIcon>

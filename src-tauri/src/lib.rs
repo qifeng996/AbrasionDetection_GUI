@@ -3,34 +3,45 @@
 mod serial;
 mod sqlite;
 
-use std::char::from_u32;
 use crate::serial::{
     deinit_device, fetch_hall_data, get_hall, get_laser, get_port, hall_parse_data, init_device,
-    motor_start_d, motor_start_u, motor_stop, rotate_motor, set_motor_single_angle, set_motor_speed,
-    start_work, stop_work, motor_start_one_circle, set_motor_single_circle_pulse,
+    motor_start_d, motor_start_one_circle, motor_start_u, motor_stop, rotate_motor, set_motor_single_angle,
+    set_motor_single_circle_pulse, set_motor_speed, start_work, stop_work,
 };
 use crate::sqlite::{connect_to_db, gen_xlsx, get_data_by_parent_id};
-use futures::{SinkExt, StreamExt, TryStreamExt};
+use futures::{SinkExt, StreamExt};
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Read;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tokio::net::UdpSocket;
 use tokio::sync::{watch, Mutex};
 use tokio::time::timeout;
-use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialStream};
-use tokio_util::bytes::Bytes;
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tokio_util::bytes::{Bytes, BytesMut};
 use tokio_util::codec::{BytesCodec, Framed};
+use umya_spreadsheet::helper::formula::FormulaTokenSubTypes::Math;
+
 pub struct AppWrapper {
     pub app_handler: AppHandle,
-    pub step_pulse: u32,
-    pub single_circle_pulse: u32,
-    pub hall_serial: Arc<Mutex<Option<Framed<SerialStream, BytesCodec>>>>,
-    pub motor_serial: Arc<Mutex<Option<Framed<SerialStream, BytesCodec>>>>,
-    pub laser_address: Arc<Mutex<Option<String>>>,
-    pub laser_socket: Arc<Mutex<Option<UdpSocket>>>,
+    pub step_pulse: Mutex<u32>,
+    single_circle_pulse: Mutex<u32>,
+    pub hall_serial: Mutex<Option<Framed<SerialStream, BytesCodec>>>,
+    pub motor_serial: Mutex<Option<Framed<SerialStream, BytesCodec>>>,
+    pub laser_address: Mutex<Option<String>>,
+    pub laser_socket: Mutex<Option<UdpSocket>>,
+    pub stop_tx: watch::Sender<bool>,
+    hall_buffer: Mutex<VecDeque<Payload>>,
+
 }
+
+enum ErrorType<E> {
+    Success([u8; 4]),
+    ResponErr(E),
+    Timeout,
+}
+
 impl AppWrapper {
     /// 初始化霍尔串口和电机串口
     pub async fn init(
@@ -53,7 +64,7 @@ impl AppWrapper {
         let motor_framed = Framed::new(motor, BytesCodec::new());
         *self.motor_serial.lock().await = Some(motor_framed);
         *self.laser_address.lock().await = Some(laser_addr.clone());
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:43000")
+        let socket = UdpSocket::bind("0.0.0.0:43000")
             .await
             .map_err(|e| e.to_string())?;
         socket
@@ -99,11 +110,18 @@ impl AppWrapper {
 
         Ok("断开成功!".to_string())
     }
-
-    pub fn set_single_circle_pulse(&mut self, pulse: u32) {
-        self.single_circle_pulse = pulse;
-        println!("Set single circle pulse{}", self.single_circle_pulse);
+    pub async fn recv_with_timeout(
+        serial: &mut Framed<SerialStream, BytesCodec>,
+        duration: Duration,
+    ) -> Result<BytesMut, String> {
+        match timeout(duration, serial.next()).await {
+            Ok(Some(Ok(bytes))) => Ok(bytes),              // 成功返回数据
+            Ok(Some(Err(e))) => Err(format!("串口接收错误: {}", e)),
+            Ok(None) => Err("串口已关闭".to_string()),      // Stream 已结束
+            Err(_) => Err("接收超时".to_string()),          // 超时
+        }
     }
+
 
     pub async fn get_hall_data(&self) -> Result<Vec<i32>, String> {
         let mut lock = self.hall_serial.lock().await;
@@ -154,7 +172,7 @@ impl AppWrapper {
             .map_err(|e| e.to_string())?;
 
         // 等待返回
-        if let Some(Ok(bytes)) = timeout(Duration::from_secs(20), serial.next())
+        if let Some(Ok(_)) = timeout(Duration::from_secs(20), serial.next())
             .await
             .map_err(|_| "电机响应超时，请检查线路连接！".to_string())?
         {
@@ -164,101 +182,111 @@ impl AppWrapper {
         }
     }
 
-
     pub async fn rotate_motor_step(&self) -> Result<(), String> {
-        self.rotate_motor_pulse(self.step_pulse).await
+        self.rotate_motor_pulse(*self.step_pulse.lock().await).await
     }
 
-    pub async fn set_motor_speed(&self, speed: f32) -> Result<String, String> {
+    async fn talk_with_motor(&self, command: u8, value: u32, duration: Duration) -> Result<[u8; 4], String> {
         let mut lock = self.motor_serial.lock().await;
-
-        // 解包 Option
         let serial = match lock.as_mut() {
             Some(s) => s,
-            None => return Err("Motor serial not initialized".into()),
+            None => return Err("Motor not initialized".into()),
         };
-        let mut pkg: [u8; 9] = [0xEF, 0xFE, 0x05, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xEE];
-        let bytes = speed.to_le_bytes();
+        let mut pkg: [u8; 9] = [0xEF, 0xFE, command, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xEE];
+        let bytes = value.to_le_bytes();
         pkg[3..7].copy_from_slice(&bytes);
-        // 发送命令
         serial
             .send(Bytes::copy_from_slice(&pkg[..]))
             .await
             .map_err(|e| e.to_string())?;
-
-        // 等待返回
-        if let Some(Ok(bytes)) = timeout(Duration::from_secs(3), serial.next())
-            .await
-            .map_err(|_| "电机响应超时，请检查线路连接！".to_string())?
-        {
-            let data = &bytes[..]; // 转成切片方便匹配
-
-            if data.len() >= 5 && data[0..5] == [0xEF, 0xFE, 0x06, 0xFF, 0xEE] {
-                println!("Got expected response from motor!");
-                // 这里可以处理正确返回
-                Ok("速度设置成功".to_string())
-            } else {
-                println!("Unexpected response: {:X?}", data);
-                Err("Invalid response from motor".into())
+        match Self::recv_with_timeout(serial, duration).await {
+            Ok(bytes) => {
+                println!("{:X}", bytes);
+                let data = &bytes[..];
+                if data[0..2] == [0xEF, 0xFE] && data[7..] == [0xFF, 0xEE] {
+                    let slice: [u8; 4] = bytes[3..7].try_into().unwrap();
+                    Ok(slice)
+                } else {
+                    Err("响应错误".into())
+                }
             }
-        } else {
-            Err("No response from Motor".into())
+            Err(_e) => Err("电机控制器响应超时！".into()),
         }
     }
 
-    pub async fn set_motor_single_angle(&mut self, angle: f32) -> Result<String, String> {
-        let pulse = angle * (self.single_circle_pulse) as f32 / 360.0_f32;
-        self.step_pulse = pulse as u32;
-        Ok(format!("设置单步脉冲个数为{}", pulse))
-    }
-    pub async fn motor_start_u(&self) -> Result<(), String> {
-        let mut lock = self.motor_serial.lock().await;
 
-        // 解包 Option
-        let serial = match lock.as_mut() {
-            Some(s) => s,
-            None => return Err("Motor serial not initialized".into()),
+    pub async fn set_motor_single_angle(&self, angle: f32) -> Result<String, String> {
+        let value = {
+            let single = self.single_circle_pulse.lock().await;
+            (angle * (*single) as f32 / 360.0_f32).ceil() as u32
         };
-        let pkg: [u8; 9] = [0xEF, 0xFE, 0x02, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xEE];
-        // 发送命令
-        serial
-            .send(Bytes::copy_from_slice(&pkg[..]))
-            .await
-            .map_err(|e| e.to_string())?;
+        match self.talk_with_motor(0, value, Duration::from_millis(1000)).await {
+            Ok(_) => {
+                *self.step_pulse.lock().await = value;
+                Ok(format!("设置单步脉冲个数为{}", value))
+            }
+            _ => { Err("电机控制器响应错误，请检查线路！".into()) }
+        }
+    }
+    pub async fn set_single_circle_pulse(&self, pulse: u32) -> Result<String, String> {
+        match self.talk_with_motor(1, pulse, Duration::from_millis(1000)).await {
+            Ok(_) => {
+                let mut value = self.single_circle_pulse.lock().await;
+                *value = pulse;
+                Ok(format!("设置单圈脉冲个数为{}", pulse))
+            }
+            _ => {
+                Err("电机控制器响应错误，请检查线路！".into())
+            }
+        }
+    }
+    pub async fn set_motor_speed(&self, speed: f32) -> Result<String, String> {
+        let tmp = {
+            *self.single_circle_pulse.lock().await
+        };
+        let value: u32 = tmp * (speed / 60_f32).ceil() as u32;
+        match self.talk_with_motor(2, value, Duration::from_millis(1000)).await {
+            Ok(_) => { Ok(format!("设置速度为{}RPM成功!", speed)) }
+            _ => { Err("电机控制器响应错误，请检查线路！".into()) }
+        }
+    }
+
+    pub async fn set_motor_calibrated(&self) -> Result<String, String> {
+        match self.talk_with_motor(3, 0, Duration::from_millis(1000)).await {
+            Ok(_) => { Ok("设置原点位置成功!".into()) }
+            _ => { Err("电机控制器响应错误，请检查线路！".into()) }
+        }
+    }
+
+    pub async fn get_motor_angle(&self) -> Result<f32, String> {
+        match self.talk_with_motor(4, 0, Duration::from_millis(1000)).await {
+            Ok(angle) => { Ok(f32::from_le_bytes(angle)) }
+            _ => { Err("电机控制器响应错误，请检查线路！".into()) }
+        }
+    }
+
+    pub async fn motor_start_work(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    pub async fn motor_start_u(&self) -> Result<(), String> {
+        match self.talk_with_motor(6, 0, Duration::from_millis(1000)).await {
+            Ok(_) => { Ok(()) }
+            _ => { Err("电机控制器响应错误，请检查线路！".into()) }
+        }
     }
     pub async fn motor_start_d(&self) -> Result<(), String> {
-        let mut lock = self.motor_serial.lock().await;
-
-        // 解包 Option
-        let serial = match lock.as_mut() {
-            Some(s) => s,
-            None => return Err("Motor serial not initialized".into()),
-        };
-        let pkg: [u8; 9] = [0xEF, 0xFE, 0x03, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xEE];
-        // 发送命令
-        serial
-            .send(Bytes::copy_from_slice(&pkg[..]))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        match self.talk_with_motor(7, 0, Duration::from_millis(1000)).await {
+            Ok(_) => { Ok(()) }
+            _ => { Err("电机控制器响应错误，请检查线路！".into()) }
+        }
     }
 
     pub async fn motor_stop(&self) -> Result<(), String> {
-        let mut lock = self.motor_serial.lock().await;
-
-        // 解包 Option
-        let serial = match lock.as_mut() {
-            Some(s) => s,
-            None => return Err("Motor serial not initialized".into()),
-        };
-        let pkg: [u8; 9] = [0xEF, 0xFE, 0x04, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xEE];
-        // 发送命令
-        serial
-            .send(Bytes::copy_from_slice(&pkg[..]))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        match self.talk_with_motor(8, 0, Duration::from_millis(1000)).await {
+            Ok(_) => { Ok(()) }
+            _ => { Err("电机控制器响应错误，请检查线路！".into()) }
+        }
     }
 
     pub async fn get_laser_data(&self) -> Result<BTreeMap<u8, Vec<u8>>, String> {
@@ -296,27 +324,6 @@ impl AppWrapper {
         }
         Ok(frames)
     }
-}
-#[derive(Clone, serde::Serialize)]
-pub struct PortInfo {
-    pub port: String,
-    pub info: String,
-}
-#[derive(Clone, serde::Serialize)]
-pub struct Payload {
-    angle: f32,
-    data: Vec<i32>,
-}
-const BUFFER_SIZE: usize = 10000; // 环形缓冲区大小
-
-#[derive(Clone)]
-pub struct SharedState {
-    hall_buffer: Arc<Mutex<VecDeque<Payload>>>,
-}
-
-
-// 后端写入数据 (替代 emit)
-impl SharedState {
     pub async fn push_hall_data(&self, payload: Payload) {
         let mut buf = self.hall_buffer.lock().await;
         if buf.len() >= BUFFER_SIZE {
@@ -339,13 +346,28 @@ impl SharedState {
     }
 }
 #[derive(Clone, serde::Serialize)]
+pub struct PortInfo {
+    pub port: String,
+    pub info: String,
+}
+#[derive(Clone, serde::Serialize)]
+pub struct Payload {
+    angle: f32,
+    data: Vec<i32>,
+}
+const BUFFER_SIZE: usize = 10000; // 环形缓冲区大小
+
+#[derive(Clone)]
+pub struct SharedState {
+    hall_buffer: Arc<Mutex<VecDeque<Payload>>>,
+}
+
+
+// 后端写入数据 (替代 emit)
+impl SharedState {}
+#[derive(Clone, serde::Serialize)]
 struct SerialPortList {
     port_vec: Vec<PortInfo>,
-}
-pub struct StateWrapper {
-    pub app: Arc<Mutex<AppWrapper>>,
-    pub stop_tx: watch::Sender<bool>,
-    pub shared_state: Arc<Mutex<SharedState>>,
 }
 
 #[tokio::main]
@@ -358,26 +380,22 @@ pub async fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 初始化 AppWrapper
-            let app_wrapper = StateWrapper {
-                app: Arc::new(Mutex::new(AppWrapper {
-                    app_handler: app.handle().clone(),
-                    step_pulse: 40,
-                    hall_serial: Arc::new(Default::default()),
-                    motor_serial: Arc::new(Default::default()),
-                    laser_address: Arc::new(Default::default()),
-                    laser_socket: Arc::new(Default::default()),
-                    single_circle_pulse: 15000,
-                })),
-                stop_tx, // 放入 stop sender
-                shared_state: Arc::new(Mutex::new(SharedState {
-                    hall_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(BUFFER_SIZE))),
-                })),
+            let app_wrapper = AppWrapper {
+                app_handler: app.handle().clone(),
+                step_pulse: 40.into(),
+                hall_serial: Default::default(),
+                motor_serial: Default::default(),
+                laser_address: Default::default(),
+                laser_socket: Default::default(),
+                single_circle_pulse: 15000.into(),
+                stop_tx,
+                hall_buffer: Mutex::new(VecDeque::with_capacity(BUFFER_SIZE)),
             };
 
             connect_to_db().expect("Failed to connect to DB");
 
             // 注入到 Tauri state
-            app.manage(app_wrapper);
+            app.manage(Arc::new(app_wrapper));
 
             Ok(())
         })
