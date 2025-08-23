@@ -11,9 +11,7 @@ use crate::serial::{
 use crate::sqlite::{connect_to_db, gen_xlsx, get_data_by_parent_id};
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
-use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -443,14 +441,6 @@ pub struct Payload {
 }
 const BUFFER_SIZE: usize = 10000; // 环形缓冲区大小
 
-#[derive(Clone)]
-pub struct SharedState {
-    hall_buffer: Arc<Mutex<VecDeque<Payload>>>,
-}
-
-
-// 后端写入数据 (替代 emit)
-impl SharedState {}
 #[derive(Clone, serde::Serialize)]
 struct SerialPortList {
     port_vec: Vec<PortInfo>,
@@ -461,7 +451,7 @@ struct SerialPortList {
 pub async fn run() {
     // 创建 stop channel
     let (stop_tx, _stop_rx) = watch::channel(false);
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, rx) = mpsc::channel(32);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {

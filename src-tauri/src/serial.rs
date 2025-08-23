@@ -1,14 +1,10 @@
 use crate::sqlite::{create_project, insert_data};
 use crate::{AppWrapper, MessagePayload, Payload, PortInfo, SerialPortList};
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tauri::Emitter;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc::Receiver;
-use tokio::time::sleep;
 use tokio_serial::SerialPortType;
 #[derive(Clone, serde::Serialize)]
 pub struct LaserData {
@@ -225,7 +221,7 @@ pub async fn start_work(
     app.clone().spawn_motor_listener().await;
     let parent_id = match create_project(name.clone(), hall_d, laser_d) {
         Ok(id) => id,
-        Err(e) => {
+        Err(_e) => {
             return Err("数据库异常！".into());
         }
     };
