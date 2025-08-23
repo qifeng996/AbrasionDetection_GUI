@@ -30,4 +30,3 @@ umya-spreadsheet = "2.2.3"
 tokio-util = { version = "0.7.16", features = ["full"] }
 futures = "0.3.31"
 tauri-plugin-dialog = "2"
-num-traits = "0.2.19"

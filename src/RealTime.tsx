@@ -321,7 +321,7 @@ function RealTime() {
                             取消
                         </Button>
                         <Button type="submit" theme={isConnected ? "danger" : "success"} form="serialForm">
-                            {isConnected ? "停止" : "开始"}
+                            {isConnected ? "断开" : "连接"}
                         </Button>
                     </div>
                 }
@@ -339,7 +339,6 @@ function RealTime() {
                             })
                         } else {
                             runInvoke("init_device", m.fields, "成功").then(() => {
-                                setDrawerVisible(false);
                                 setIsConnected(true);
                             })
                         }
@@ -387,7 +386,7 @@ function RealTime() {
                         labelWidth={60}
                         disabled={!isConnected}
                         labelAlign={'left'}
-                        initialData={{speed: 20}}
+                        initialData={{speed: 0.5}}
                         onSubmit={(m) => {
                             runInvoke<string>('set_motor_speed', m.fields)
                         }}>
@@ -449,9 +448,6 @@ function RealTime() {
                         角度清零
                     </Button>
                     <Button disabled={!isConnected} block onClick={() => {
-                        invoke("motor_start_one_circle")
-                    }}>测试单圈</Button>
-                    <Button disabled={!isConnected} block onClick={() => {
                         invoke("motor_start_u")
                     }}>手动正转</Button>
                     <Button disabled={!isConnected} block onClick={() => {
@@ -504,7 +500,7 @@ function RealTime() {
                     }
                     await runInvoke("start_work", m.fields, "开始采集")
                 }}
-                      initialData={{hallD: 428, laserD: 428, limit: [320, 960]}}
+                      initialData={{hallD: 20, laserD: 428}}
                 >
                     <Space direction={'vertical'}>
                         <Form.FormItem name={'name'} label={'采集备注'}
