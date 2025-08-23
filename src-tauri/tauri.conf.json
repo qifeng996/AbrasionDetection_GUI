@@ -18,6 +18,7 @@
         "fullscreen": false,
         "theme": "Light",
         "resizable": false,
+        "maximizable": false,
         "maximized": true
       }
     ],
