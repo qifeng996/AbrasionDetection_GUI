@@ -1,5 +1,5 @@
 use crate::sqlite::{create_project, insert_data};
-use crate::{AppWrapper, Payload, PortInfo, SerialPortList};
+use crate::{AppWrapper, MessagePayload, Payload, PortInfo, SerialPortList};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -7,6 +7,7 @@ use std::time::Duration;
 use tauri::Emitter;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
 use tokio_serial::SerialPortType;
 #[derive(Clone, serde::Serialize)]
@@ -162,8 +163,19 @@ pub async fn set_motor_single_angle(
 ) -> Result<String, String> {
     app.set_motor_single_angle(angle).await
 }
+#[tauri::command]
+pub async fn get_motor_angle(
+    app: tauri::State<'_, Arc<AppWrapper>>,
+) -> Result<f32, String> {
+    app.get_motor_angle().await
+}
 
-
+#[tauri::command]
+pub async fn set_motor_calibrated(
+    app: tauri::State<'_, Arc<AppWrapper>>,
+) -> Result<String, String> {
+    app.set_motor_calibrated().await
+}
 #[tauri::command]
 pub async fn motor_start_one_circle(app: tauri::State<'_, Arc<AppWrapper>>) -> Result<(), String> {
     app.rotate_motor_pulse(*app.single_circle_pulse.lock().await).await
@@ -192,6 +204,7 @@ pub async fn set_motor_single_circle_pulse(app: tauri::State<'_, Arc<AppWrapper>
     app.set_single_circle_pulse(pulse).await
 }
 
+
 #[tauri::command]
 pub async fn start_work(
     app: tauri::State<'_, Arc<AppWrapper>>,
@@ -207,164 +220,132 @@ pub async fn start_work(
     // 创建一个停止信号 channel
     let stop_rx = app.stop_tx.subscribe();
     let app = Arc::clone(&app);
-
-    // 启动后台任务
-    tokio::spawn(async move {
-        let laser_path = laser_path.clone();
-        let hall_path = hall_path.clone();
-        let name = name.clone();
-        let hall_d = hall_d.clone();
-        let laser_d = laser_d.clone();
-        let mut current_pulse: u32 = 0;
-        let single_circle_pulse = *app.single_circle_pulse.lock().await;
-        let v_path = v_path.clone();
-        let parent_id = match create_project(name, hall_d, laser_d) {
-            Ok(id) => id,
-            Err(e) => {
-                app
-                    .app_handler
-                    .emit("error", json!({ "mes": e }))
-                    .expect("TODO: panic message");
-                return;
-            }
-        };
-        let step_pulse: u32;
-        {
-            step_pulse = *app.step_pulse.lock().await;
+    app.motor_start_work().await?;
+    // 启动监听任务（只启动一次即可）
+    app.clone().spawn_motor_listener().await;
+    let parent_id = match create_project(name.clone(), hall_d, laser_d) {
+        Ok(id) => id,
+        Err(e) => {
+            return Err("数据库异常！".into());
         }
+    };
+    tokio::spawn(async move {
+        let mut lock = app.motor_rx.lock().await;
+        let mut stop_rx = stop_rx; // mutable
+        let mut laser_file = OpenOptions::new()
+            .create(true) // 文件不存在就创建
+            .append(true) // 追加而不是覆盖
+            .open(laser_path)
+            .await
+            .expect("无法打开文件");
+        let mut hall_file = OpenOptions::new()
+            .create(true) // 文件不存在就创建
+            .append(true) // 追加而不是覆盖
+            .open(hall_path)
+            .await
+            .expect("无法打开文件");
+        let mut v_file = OpenOptions::new()
+            .create(true) // 文件不存在就创建
+            .append(true) // 追加而不是覆盖
+            .open(v_path)
+            .await
+            .expect("无法打开文件");
         loop {
-            // 检查是否收到停止信号
-            if *stop_rx.borrow() {
-                println!("Background task stopping...");
-                return;
-            }
-            let current_angle = current_pulse as f32 * 360_f32 / single_circle_pulse as f32;
-            // 1. 采集霍尔数据
-            {
-                match app.get_hall_data().await {
-                    Ok(hall_data) => match insert_data(parent_id, current_angle, &hall_data) {
-                        Ok(_) => {
-                            // app_lock
-                            //     .app_handler
-                            //     .emit("hall_recv", Payload { angle: current_angle, data: hall_data })
-                            //     .expect("TODO: panic message");
-                            let mut v_array: Vec<f32> = Vec::new();
-                            for hall_datum in &hall_data {
-                                let v = (1650_f32 * (*hall_datum as f32) / 8388607_f32) / 64_f32;
-                                v_array.push(v);
+            tokio::select! {
+                angle = lock.recv() => {
+                    match angle {
+                        Some(a) => {
+                            let hall_data = app.get_hall_data().await;
+                            let laser_data = app.get_laser_data().await;
+                            match hall_data {
+                                Ok(data) => {
+                                    match insert_data(parent_id, a, &data) {
+                                        Ok(_) => {
+                                            let mut v_array: Vec<f32> = Vec::new();
+                                            for hall_datum in &data {
+                                                let v = (1650_f32 * (*hall_datum as f32) / 8388607_f32) / 64_f32;
+                                                v_array.push(v);
+                                            }
+                                            let v_line = format!("{} {} {} {} {} {} {} {} {} {}\n",
+                                                                 a,
+                                                                 v_array[0],
+                                                                 v_array[1],
+                                                                 v_array[2],
+                                                                 v_array[3],
+                                                                 v_array[4],
+                                                                 v_array[5],
+                                                                 v_array[6],
+                                                                 v_array[7],
+                                                                 v_array[8],
+                                            );
+                                            v_file.write_all(v_line.as_bytes()).await.expect("写入失败");
+                                            let line = format!(" {} {} {} {} {} {} {} {} {} {}\n",
+                                                               a,
+                                                               data[0],
+                                                               data[1],
+                                                               data[2],
+                                                               data[3],
+                                                               data[4],
+                                                               data[5],
+                                                               data[6],
+                                                               data[7],
+                                                               data[8],
+                                            );
+                                            hall_file.write_all(line.as_bytes()).await.expect("写入失败");
+                                            app.push_hall_data(Payload { angle:a, data }).await;
+                                        }
+                                        Err(e) => {
+                                            app.app_handler.emit("message", MessagePayload {
+                                                title: "霍尔传感器异常".to_string(),
+                                                message: e,
+                                                _type: "error".to_string(),
+                                            }).unwrap();
+                                        }
+                                    }
+                                }
+
+                                Err(e) => {
+                                    eprintln!("Error getting hall data: {}", e);
+                                    app.app_handler.emit("message", MessagePayload {
+                                        title: "霍尔传感器异常".to_string(),
+                                        message: e,
+                                        _type: "error".to_string(),
+                                    }).unwrap();
+                                    return;
+                                }
                             }
-                            let mut v_file = OpenOptions::new()
-                                .create(true) // 文件不存在就创建
-                                .append(true) // 追加而不是覆盖
-                                .open(&v_path)
-                                .await
-                                .expect("无法打开文件");
-                            let v_line = format!("{} {} {} {} {} {} {} {} {} {}\n",
-                                                 current_angle,
-                                                 v_array[0],
-                                                 v_array[1],
-                                                 v_array[2],
-                                                 v_array[3],
-                                                 v_array[4],
-                                                 v_array[5],
-                                                 v_array[6],
-                                                 v_array[7],
-                                                 v_array[8],
-                            );
-                            v_file.write_all(v_line.as_bytes()).await.expect("写入失败");
-                            let mut file = OpenOptions::new()
-                                .create(true) // 文件不存在就创建
-                                .append(true) // 追加而不是覆盖
-                                .open(&hall_path)
-                                .await
-                                .expect("无法打开文件");
-                            let line = format!(" {} {} {} {} {} {} {} {} {} {}\n",
-                                               current_angle,
-                                               hall_data[0],
-                                               hall_data[1],
-                                               hall_data[2],
-                                               hall_data[3],
-                                               hall_data[4],
-                                               hall_data[5],
-                                               hall_data[6],
-                                               hall_data[7],
-                                               hall_data[8],
-                            );
-                            file.write_all(line.as_bytes()).await.expect("写入失败");
-
-                            app.push_hall_data(Payload { angle: current_angle, data: hall_data }).await;
+                            match laser_data {
+                                Ok(data) => {
+                                    if let Some(data) = laser_parse_data(data, a, laser_d) {
+                                        for datum in data {
+                                            let line = format!("{} {} {}\n", datum.x, datum.y, datum.z);
+                                            laser_file.write_all(line.as_bytes()).await.expect("写入失败");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Error getting laser data: {}", e);
+                                    return;
+                                }
+                            }
+                            println!("Angle={}", a);
+                            // TODO: 拿传感器数据并存储
                         }
-                        Err(e) => {
-                            app
-                                .app_handler
-                                .emit("error", json!({ "mes": e }))
-                                .expect("TODO: panic message");
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("Error getting hall data: {}", e);
-                        app
-                            .app_handler
-                            .emit("error", json!({ "mes": "霍尔传感器响应超时，任务终止！" }))
-                            .expect("TODO: panic message");
+                        None => break, // channel 关闭
+                    }
+                }
 
-                        return;
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() {
+                        println!("Motor listener stopping...");
+                        break;
                     }
                 }
             }
-
-            // 2. 采集激光位移传感器数据
-            // {
-            //     let app_lock = app.lock().await;
-            //     match app_lock.get_laser_data().await {
-            //         Ok(laser_data) => {
-            //             if let Some(data) = laser_parse_data(laser_data, current_angle, laser_d) {
-            //                 let mut file = OpenOptions::new()
-            //                     .create(true) // 文件不存在就创建
-            //                     .append(true) // 追加而不是覆盖
-            //                     .open(laser_path.clone())
-            //                     .await
-            //                     .expect("无法打开文件");
-            //                 for datum in data {
-            //                     let line = format!("{} {} {}\n", datum.x, datum.y, datum.z);
-            //                     file.write_all(line.as_bytes()).await.expect("写入失败");
-            //                 }
-            //             }
-            //         }
-            //         Err(e) => {
-            //             eprintln!("Error getting laser data: {}", e);
-            //             return;
-            //         }
-            //     }
-            // }
-
-            // 3. 控制电机旋转到当前角度
-            // {
-            //     let app_lock = app.lock().await;
-            //     if let Err(e) = app_lock.rotate_motor_step().await {
-            //         eprintln!("Error rotating motor: {}", e);
-            //         return;
-            //     } else {
-            //         current_pulse += step_pulse;
-            //         println!("current angle: {}", current_angle);
-            //         if current_pulse >= single_circle_pulse {
-            //             println!("One full rotation completed");
-            //             break;
-            //         }
-            //     }
-            // }
-            current_pulse += step_pulse;
-            println!("current angle: {}", current_angle);
-            if current_pulse >= single_circle_pulse {
-                println!("One full rotation completed");
-                break;
-            }
-            // 避免 CPU 空转
-            sleep(Duration::from_millis(200)).await;
         }
     });
 
-    Ok("Background work started".into())
+    Ok("任务已启动".into())
 }
 
 #[tauri::command]

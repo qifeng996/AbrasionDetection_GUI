@@ -4,25 +4,32 @@ mod serial;
 mod sqlite;
 
 use crate::serial::{
-    deinit_device, fetch_hall_data, get_hall, get_laser, get_port, hall_parse_data, init_device,
-    motor_start_d, motor_start_one_circle, motor_start_u, motor_stop, rotate_motor, set_motor_single_angle,
-    set_motor_single_circle_pulse, set_motor_speed, start_work, stop_work,
+    deinit_device, fetch_hall_data, get_hall, get_laser, get_motor_angle, get_port, hall_parse_data,
+    init_device, motor_start_d, motor_start_one_circle, motor_start_u, motor_stop, rotate_motor,
+    set_motor_calibrated, set_motor_single_angle, set_motor_single_circle_pulse, set_motor_speed, start_work, stop_work,
 };
 use crate::sqlite::{connect_to_db, gen_xlsx, get_data_by_parent_id};
 use futures::{SinkExt, StreamExt};
+use serde::Serialize;
+use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
-use std::process::Command;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::timeout;
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tokio_util::bytes::{Bytes, BytesMut};
 use tokio_util::codec::{BytesCodec, Framed};
-use umya_spreadsheet::helper::formula::FormulaTokenSubTypes::Math;
 
+#[derive(Clone, Serialize)]
+struct MessagePayload {
+    message: String,
+    title: String,
+    _type: String,
+}
 pub struct AppWrapper {
     pub app_handler: AppHandle,
     pub step_pulse: Mutex<u32>,
@@ -33,15 +40,10 @@ pub struct AppWrapper {
     pub laser_socket: Mutex<Option<UdpSocket>>,
     pub stop_tx: watch::Sender<bool>,
     hall_buffer: Mutex<VecDeque<Payload>>,
+    pub motor_tx: mpsc::Sender<f32>,
+    pub motor_rx: Mutex<mpsc::Receiver<f32>>,
 
 }
-
-enum ErrorType<E> {
-    Success([u8; 4]),
-    ResponErr(E),
-    Timeout,
-}
-
 impl AppWrapper {
     /// 初始化霍尔串口和电机串口
     pub async fn init(
@@ -121,7 +123,49 @@ impl AppWrapper {
             Err(_) => Err("接收超时".to_string()),          // 超时
         }
     }
+    pub async fn spawn_motor_listener(self: Arc<Self>) {
+        let stop_rx = self.stop_tx.subscribe();
+        let tx = self.motor_tx.clone();
 
+        tokio::spawn(async move {
+            loop {
+                if *stop_rx.borrow() {
+                    println!("Motor listener stopping...");
+                    match self.motor_stop_work().await {
+                        Ok(str) => {
+                            self.app_handler.emit("message", MessagePayload {
+                                title: "关闭成功".to_string(),
+                                message: str,
+                                _type: "success".to_string(),
+                            }).unwrap();
+                        }
+                        Err(e) => {
+                            self.app_handler.emit("message", MessagePayload {
+                                title: "关闭失败".to_string(),
+                                message: e,
+                                _type: "error".to_string(),
+                            }).unwrap();
+                        }
+                    }
+                    break;
+                }
+                match self.recv_res(Duration::from_secs(4)).await {
+                    Ok(angle) => {
+                        // 收到角度，发到 channel
+                        if tx.send(angle).await.is_err() {
+                            println!("No receiver for motor data");
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        // 超时不处理，继续等
+                        self.app_handler.emit("error", json!({ "mes": "电机控制板通信超时！" })).expect("todo");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     pub async fn get_hall_data(&self) -> Result<Vec<i32>, String> {
         let mut lock = self.hall_serial.lock().await;
@@ -186,7 +230,29 @@ impl AppWrapper {
         self.rotate_motor_pulse(*self.step_pulse.lock().await).await
     }
 
-    async fn talk_with_motor(&self, command: u8, value: u32, duration: Duration) -> Result<[u8; 4], String> {
+
+    async fn recv_res(&self, duration: Duration) -> Result<f32, String> {
+        let mut lock = self.motor_serial.lock().await;
+        let serial = match lock.as_mut() {
+            Some(s) => s,
+            None => return Err("Motor not initialized".into()),
+        };
+        match Self::recv_with_timeout(serial, duration).await {
+            Ok(bytes) => {
+                // println!("{:X}", bytes);
+                let data = &bytes[..];
+                if data[0..2] == [0xEF, 0xFE] && data[7..] == [0xFF, 0xEE] {
+                    let slice = u32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
+                    Ok(f32::from_bits(slice))
+                } else {
+                    Err("响应错误".into())
+                }
+            }
+            Err(_e) => Err("电机控制器响应超时！".into()),
+        }
+    }
+
+    async fn talk_with_motor(&self, command: u8, value: u32, duration: Duration) -> Result<u32, String> {
         let mut lock = self.motor_serial.lock().await;
         let serial = match lock.as_mut() {
             Some(s) => s,
@@ -204,7 +270,7 @@ impl AppWrapper {
                 println!("{:X}", bytes);
                 let data = &bytes[..];
                 if data[0..2] == [0xEF, 0xFE] && data[7..] == [0xFF, 0xEE] {
-                    let slice: [u8; 4] = bytes[3..7].try_into().unwrap();
+                    let slice = u32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
                     Ok(slice)
                 } else {
                     Err("响应错误".into())
@@ -241,10 +307,12 @@ impl AppWrapper {
         }
     }
     pub async fn set_motor_speed(&self, speed: f32) -> Result<String, String> {
+        println!("speed: {}", speed);
         let tmp = {
             *self.single_circle_pulse.lock().await
         };
-        let value: u32 = tmp * (speed / 60_f32).ceil() as u32;
+        let value: u32 = (tmp as f32 * speed / 60_f32).ceil() as u32;
+        println!("value: {}", value);
         match self.talk_with_motor(2, value, Duration::from_millis(1000)).await {
             Ok(_) => { Ok(format!("设置速度为{}RPM成功!", speed)) }
             _ => { Err("电机控制器响应错误，请检查线路！".into()) }
@@ -260,15 +328,28 @@ impl AppWrapper {
 
     pub async fn get_motor_angle(&self) -> Result<f32, String> {
         match self.talk_with_motor(4, 0, Duration::from_millis(1000)).await {
-            Ok(angle) => { Ok(f32::from_le_bytes(angle)) }
+            Ok(angle) => { Ok(f32::from_bits(angle)) }
             _ => { Err("电机控制器响应错误，请检查线路！".into()) }
         }
     }
 
-    pub async fn motor_start_work(&self) -> Result<(), String> {
-        Ok(())
+    pub async fn motor_start_work(&self) -> Result<String, String> {
+        match self.talk_with_motor(5, 0, Duration::from_millis(1000)).await {
+            Ok(_) => { Ok("开始检测！".into()) }
+            _ => { Err("电机控制器响应错误，请检查线路！".into()) }
+        }
     }
 
+    pub async fn motor_stop_work(&self) -> Result<String, String> {
+        match self.talk_with_motor(9, 0, Duration::from_secs(1)).await {
+            Ok(_) => {
+                Ok("停止任务成功！".into())
+            }
+            Err(e) => {
+                Err(e)
+            }
+        }
+    }
     pub async fn motor_start_u(&self) -> Result<(), String> {
         match self.talk_with_motor(6, 0, Duration::from_millis(1000)).await {
             Ok(_) => { Ok(()) }
@@ -375,10 +456,11 @@ struct SerialPortList {
 pub async fn run() {
     // 创建 stop channel
     let (stop_tx, _stop_rx) = watch::channel(false);
-
+    let (tx, mut rx) = mpsc::channel(32);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+
             // 初始化 AppWrapper
             let app_wrapper = AppWrapper {
                 app_handler: app.handle().clone(),
@@ -390,6 +472,8 @@ pub async fn run() {
                 single_circle_pulse: 15000.into(),
                 stop_tx,
                 hall_buffer: Mutex::new(VecDeque::with_capacity(BUFFER_SIZE)),
+                motor_tx: tx,
+                motor_rx: Mutex::new(rx),
             };
 
             connect_to_db().expect("Failed to connect to DB");
@@ -418,7 +502,9 @@ pub async fn run() {
             stop_work,
             fetch_hall_data,
             motor_start_one_circle,
-            set_motor_single_circle_pulse
+            set_motor_single_circle_pulse,
+            get_motor_angle,
+            set_motor_calibrated
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

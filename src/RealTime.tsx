@@ -8,8 +8,7 @@ import {
     InputNumber,
     NotificationPlugin,
     Select,
-    Slider,
-    Space, Typography
+    Space
 } from "tdesign-react";
 import {invoke, InvokeArgs} from "@tauri-apps/api/core";
 import * as echarts from "echarts";
@@ -32,8 +31,10 @@ interface serial_list {
 }
 
 
-interface ErrorPayload {
-    mes: string;
+interface MessagePayload {
+    _type: 'info' | 'success' | 'warning' | 'error';
+    title: string;
+    message: string;
 }
 
 
@@ -83,6 +84,7 @@ function RealTime() {
     const dataChart = useRef<echarts.ECharts | null>(null);
     const timerID = useRef<number | null>(null);
     const [form] = Form.useForm();
+    const [angle, setAngle] = useState<number>(0.00);
     // const bandRateList: number[] = [
     //     110, 300, 600, 1200, 2400, 4800, 9600, 14400, 19200, 38400,
     //     56000, 57600, 115200, 128000, 230400, 256000,
@@ -201,15 +203,27 @@ function RealTime() {
             }
             dataChart.current?.resize();
         });
-        listen<ErrorPayload>("error", async (event) => {
-            await NotificationPlugin.error({
-                title: "采集终止",
-                content: String(event.payload.mes),
-                placement: "top-right",
-                duration: 3000,
-                offset: [0, 0],
-                closeBtn: true,
-            })
+        listen<MessagePayload>("message", async (event) => {
+            if (event.payload._type == 'error') {
+                await NotificationPlugin.error({
+                    title: String(event.payload.title),
+                    content: String(event.payload.message),
+                    placement: "top-right",
+                    duration: 3000,
+                    offset: [0, 0],
+                    closeBtn: true,
+                })
+            } else if (event.payload._type == 'success') {
+                await NotificationPlugin.success({
+                    title: String(event.payload.title),
+                    content: String(event.payload.message),
+                    placement: "top-right",
+                    duration: 3000,
+                    offset: [0, 0],
+                    closeBtn: true,
+                })
+            }
+
         }).then((fn) => {
             unlisten = fn
         })
@@ -267,6 +281,8 @@ function RealTime() {
                 }}>
                     停止采集
                 </Button>
+
+
                 <Button
                     shape="rectangle"
                     size="medium"
@@ -291,7 +307,7 @@ function RealTime() {
                 >
                     设置
                 </Button>
-                <Card>当前角度：0.00°</Card>
+
             </Space>
 
 
@@ -417,6 +433,21 @@ function RealTime() {
                                     form={'MotorPulse'}>变更</Button>
                         </Space>
                     </Form>
+                    <Card>当前角度：{angle}°</Card>
+                    <Button disabled={!isConnected} block onClick={async () => {
+                        await runInvoke<number>("get_motor_angle").then((res) => {
+                            setAngle(res)
+                        })
+                    }}>
+                        检测角度
+                    </Button>
+                    <Button disabled={!isConnected} block onClick={async () => {
+                        await runInvoke<string>("set_motor_calibrated").then((_) => {
+                            setAngle(0.00)
+                        })
+                    }}>
+                        角度清零
+                    </Button>
                     <Button disabled={!isConnected} block onClick={() => {
                         invoke("motor_start_one_circle")
                     }}>测试单圈</Button>
@@ -489,11 +520,6 @@ function RealTime() {
                                        rules={[{required: true, message: '请输入激光距离'}]}>
                             <InputNumber style={{width: '100%'}} suffix={'mm'} autoWidth></InputNumber>
                         </Form.FormItem>
-
-                        <Form.FormItem name={'limit'} label={'采集范围'}>
-                            <Slider range min={0} max={1280}></Slider>
-                        </Form.FormItem>
-
                         <Space direction={'horizontal'}>
                             <Form.FormItem name={'laserPath'} label={'外形存储路径'}
                                            rules={[{required: true, message: '请选择存储路径'}]}>

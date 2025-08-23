@@ -107,7 +107,7 @@ pub fn insert_data(parent_id: i64, angle: f32, data: &Vec<i32>) -> Result<(), St
 
 #[tauri::command]
 pub fn get_data_by_parent_id(
-    state: tauri::State<AppWrapper>,
+    _state: tauri::State<AppWrapper>,
     parent_id: i32,
 ) -> Result<Vec<Data>, String> {
     let conn = connect_to_db().expect("Failed to connect to DB");
