@@ -242,6 +242,9 @@ impl AppWrapper {
                 // println!("{:X}", bytes);
                 let data = &bytes[..];
                 if data[0..2] == [0xEF, 0xFE] && data[7..] == [0xFF, 0xEE] {
+                    if data[3] == 0x09 {
+                        self.stop_tx.send(true).unwrap();
+                    }
                     let slice = u32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
                     Ok(f32::from_bits(slice))
                 } else {
