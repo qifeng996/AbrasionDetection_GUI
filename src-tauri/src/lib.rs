@@ -154,13 +154,15 @@ impl AppWrapper {
                         // 收到角度，发到 channel
                         if tx.send(angle).await.is_err() {
                             println!("No receiver for motor data");
-                            break;
                         }
                     }
                     Err(_) => {
                         // 超时不处理，继续等
-                        self.app_handler.emit("error", json!({ "mes": "电机控制板通信超时！" })).expect("todo");
-                        break;
+                        self.app_handler.emit("message", MessagePayload {
+                            title: "关闭失败".to_string(),
+                            message: "电机控制板通信超时！".into(),
+                            _type: "error".to_string(),
+                        }).expect("todo");
                     }
                 }
             }
