@@ -486,6 +486,7 @@ function RealTime() {
 
             >
                 <Form id={'workInfo'} form={form} labelWidth={120} onSubmit={async (m) => {
+                    console.log(m.fields)
                     if (dataChart.current) {
                         dataChart.current.setOption({
                             series: Array.from({length: 9}).map((_, index) => ({

@@ -122,7 +122,7 @@ impl AppWrapper {
         }
     }
     pub async fn spawn_motor_listener(self: Arc<Self>) {
-        let stop_rx = self.stop_tx.subscribe();
+        let mut stop_rx = self.stop_tx.subscribe();
         let tx = self.motor_tx.clone();
 
         tokio::spawn(async move {
@@ -160,7 +160,8 @@ impl AppWrapper {
                             title: "关闭失败".to_string(),
                             message: "电机控制板通信超时！".into(),
                             _type: "error".to_string(),
-                        }).expect("todo");
+                        }).unwrap();
+                        break;
                     }
                 }
             }
@@ -181,7 +182,6 @@ impl AppWrapper {
             .send(Bytes::copy_from_slice(&pkg[..]))
             .await
             .map_err(|e| e.to_string())?;
-
         let mut buf = Vec::new();
         let expected_len = 44;
 
