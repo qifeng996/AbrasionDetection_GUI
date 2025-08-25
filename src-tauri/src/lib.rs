@@ -122,7 +122,7 @@ impl AppWrapper {
         }
     }
     pub async fn spawn_motor_listener(self: Arc<Self>) {
-        let mut stop_rx = self.stop_tx.subscribe();
+        let stop_rx = self.stop_tx.subscribe();
         let tx = self.motor_tx.clone();
 
         tokio::spawn(async move {
